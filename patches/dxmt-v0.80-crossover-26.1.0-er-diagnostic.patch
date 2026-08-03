@@ -1,0 +1,254 @@
+diff --git a/src/airconv/airconv_public.h b/src/airconv/airconv_public.h
+index 3b82a0b..ae6eb3a 100644
+--- a/src/airconv/airconv_public.h
++++ b/src/airconv/airconv_public.h
+@@ -226,6 +226,7 @@ enum SM50_SHADER_FLAG {
+   SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO = 1 << 0,
+   SM50_SHADER_FLAG_DEFUSE_FMA = 1 << 1,
+   SM50_SHADER_FLAG_SANITIZE_OUTPUT = 1 << 2,
++  SM50_SHADER_FLAG_MARK_NONFINITE_OUTPUT = 1 << 3,
+ };
+ 
+ struct SM50_SHADER_COMMON_DATA {
+diff --git a/src/airconv/dxbc_converter.cpp b/src/airconv/dxbc_converter.cpp
+index 2603b46..30d0f58 100644
+--- a/src/airconv/dxbc_converter.cpp
++++ b/src/airconv/dxbc_converter.cpp
+@@ -452,6 +452,7 @@ llvm::Error convert_dxbc_pixel_shader(
+     sig_ctx.dual_source_blending = pso_dual_source_blending;
+     sig_ctx.disable_depth_output = pso_disable_depth_output;
+     sig_ctx.sanitize_output = bool(shader_flags & SM50_SHADER_FLAG_SANITIZE_OUTPUT);
++    sig_ctx.mark_nonfinite_output = bool(shader_flags & SM50_SHADER_FLAG_MARK_NONFINITE_OUTPUT);
+     sig_ctx.pull_mode_reg_mask = shader_info->pull_mode_reg_mask;
+     sig_ctx.unorm_output_reg_mask = pso_unorm_output_reg_mask;
+     for (auto &p : pShaderInternal->signature_handlers) {
+diff --git a/src/airconv/dxbc_converter.hpp b/src/airconv/dxbc_converter.hpp
+index 538b8ad..1c0844e 100644
+--- a/src/airconv/dxbc_converter.hpp
++++ b/src/airconv/dxbc_converter.hpp
+@@ -279,5 +279,8 @@ std::function<IRValue(pvalue)>
+ pop_output_reg_sanitize_float(uint32_t from_reg, uint32_t mask, uint32_t to_element);
+ 
++std::function<IRValue(pvalue)>
++pop_output_reg_mark_nonfinite_float(uint32_t from_reg, uint32_t mask, uint32_t to_element);
++
+ std::function<IRValue(pvalue)>
+ pop_output_reg_fix_unorm(uint32_t from_reg, uint32_t mask, uint32_t to_element);
+ 
+@@ -337,6 +340,7 @@ struct SignatureContext {
+   bool disable_depth_output;
+   bool skip_vertex_output;
+   bool sanitize_output;
++  bool mark_nonfinite_output;
+   uint32_t pull_mode_reg_mask;
+   uint32_t unorm_output_reg_mask;
+ 
+@@ -345,7 +349,7 @@ struct SignatureContext {
+   )
+       : prologue(prologue), epilogue(epilogue), func_signature(func_signature), resource(resource), ia_layout(nullptr),
+         dual_source_blending(false), disable_depth_output(false), skip_vertex_output(false), sanitize_output(false),
+-        pull_mode_reg_mask(0), unorm_output_reg_mask(0){};
++        mark_nonfinite_output(false), pull_mode_reg_mask(0), unorm_output_reg_mask(0){};
+ };
+ 
+ struct MeshOutputContext {
+diff --git a/src/airconv/dxbc_converter_basicblock.cpp b/src/airconv/dxbc_converter_basicblock.cpp
+index ca0aca2..6181eb2 100644
+--- a/src/airconv/dxbc_converter_basicblock.cpp
++++ b/src/airconv/dxbc_converter_basicblock.cpp
+@@ -331,6 +331,28 @@ pop_output_reg_sanitize_float(uint32_t from_reg, uint32_t mask, uint32_t to_elem
+   };
+ }
+ 
++std::function<IRValue(pvalue)>
++pop_output_reg_mark_nonfinite_float(uint32_t from_reg, uint32_t mask, uint32_t to_element) {
++  return [=](pvalue ret) {
++    return make_irvalue_bind([=](context ctx) {
++      auto const_index =
++        llvm::ConstantInt::get(ctx.llvm, llvm::APInt{32, from_reg, false});
++      auto desired_type =
++        ctx.function->getReturnType()->getStructElementType(to_element);
++      return load_from_array_at(
++               ctx.resource.output.ptr_float4, const_index
++             ) >>= [=, &ctx](auto fvec4) {
++        auto marked = ctx.air.getNonFiniteToMarker(fvec4, mask);
++        auto ivec4 = ctx.builder.CreateBitCast(marked, ctx.types._int4);
++        return to_desired_type_from_int_vec4(ivec4, desired_type, mask) |
++               [=, &ctx](auto value) {
++                 return ctx.builder.CreateInsertValue(ret, value, {to_element});
++               };
++      };
++    });
++  };
++}
++
+ std::function<IRValue(pvalue)> pop_output_reg_fix_unorm(uint32_t from_reg, uint32_t mask, uint32_t to_element) {
+   return [=](pvalue ret) {
+     return make_irvalue_bind([=](context ctx) -> IRValue {
+diff --git a/src/airconv/dxbc_signature.cpp b/src/airconv/dxbc_signature.cpp
+index c4e3d8d..67c0d2c 100644
+--- a/src/airconv/dxbc_signature.cpp
++++ b/src/airconv/dxbc_signature.cpp
+@@ -593,9 +593,14 @@ void handle_signature_ps(
+           });
+         }
+-        if (type == RegisterComponentType::Float && ctx.unorm_output_reg_mask & (1 << reg))
++        if (type == RegisterComponentType::Float &&
++            ctx.mark_nonfinite_output &&
++            ctx.sanitize_output &&
++            !env_disabled("DXMT_DISABLE_OUTPUT_SANITIZE"))
++          ctx.epilogue >> pop_output_reg_mark_nonfinite_float(reg, mask, assigned_index);
++        else if (type == RegisterComponentType::Float && ctx.unorm_output_reg_mask & (1 << reg))
+           ctx.epilogue >> pop_output_reg_fix_unorm(reg, mask, assigned_index);
+         else if (type == RegisterComponentType::Float &&
+                  ctx.sanitize_output &&
+                  !env_disabled("DXMT_DISABLE_OUTPUT_SANITIZE"))
+           ctx.epilogue >> pop_output_reg_sanitize_float(reg, mask, assigned_index);
+         else
+diff --git a/src/airconv/nt/air_builder.hpp b/src/airconv/nt/air_builder.hpp
+index 4f5326d..33d8401 100644
+--- a/src/airconv/nt/air_builder.hpp
++++ b/src/airconv/nt/air_builder.hpp
+@@ -552,6 +552,45 @@ public:
+     return builder.CreateSelect(NonFinite, Constant::getNullValue(OperandType), Operand);
+   };
+ 
++  Value *
++  getNonFiniteToMarker(Value *Operand, uint32_t ComponentMask) {
++    auto OperandType = Operand->getType();
++    llvm::Value *BitsAbs = getInt(0x7fffffffu);
++    llvm::Value *BitsInf = getInt(0x7f800000u);
++    llvm::Type *TyCast = getIntTy();
++    llvm::Value *Marker = getFloat(1.0f);
++
++    if (auto TyVec = dyn_cast<llvm::FixedVectorType>(OperandType)) {
++      auto NumElements = TyVec->getNumElements();
++      BitsAbs = builder.CreateVectorSplat(NumElements, BitsAbs);
++      BitsInf = builder.CreateVectorSplat(NumElements, BitsInf);
++      TyCast = getIntTy(NumElements);
++      Marker = builder.CreateVectorSplat(NumElements, Marker);
++
++      auto NonFinite = builder.CreateICmpUGE(
++        builder.CreateAnd(builder.CreateBitCast(Operand, TyCast), BitsAbs),
++        BitsInf
++      );
++      llvm::Value *AnyNonFinite = nullptr;
++      for (uint32_t i = 0; i < NumElements; i++) {
++        if (!(ComponentMask & (1u << i)))
++          continue;
++        auto Lane = builder.CreateExtractElement(NonFinite, i);
++        AnyNonFinite = AnyNonFinite ? builder.CreateOr(AnyNonFinite, Lane) : Lane;
++      }
++      if (!AnyNonFinite)
++        return Operand;
++      auto MarkAllLanes = builder.CreateVectorSplat(NumElements, AnyNonFinite);
++      return builder.CreateSelect(MarkAllLanes, Marker, Operand);
++    }
++
++    auto NonFinite = builder.CreateICmpUGE(
++      builder.CreateAnd(builder.CreateBitCast(Operand, TyCast), BitsAbs),
++      BitsInf
++    );
++    return builder.CreateSelect(NonFinite, Marker, Operand);
++  };
++
+   std::string getTypeOverloadSuffix(Type *Ty, Signedness Sign = Signedness::DontCare);
+ 
+ protected:
+diff --git a/src/d3d11/d3d11_pipeline_cache.cpp b/src/d3d11/d3d11_pipeline_cache.cpp
+index ec17d04..921a41d 100644
+--- a/src/d3d11/d3d11_pipeline_cache.cpp
++++ b/src/d3d11/d3d11_pipeline_cache.cpp
+@@ -7,13 +7,48 @@
+ #include "dxmt_tasks.hpp"
+ #include "log/log.hpp"
+ #include "sha1/sha1_util.hpp"
++#include "util_env.hpp"
++#include "util_string.hpp"
+ #include "../d3d10/d3d10_shader.hpp"
+ #include "../d3d10/d3d10_input_layout.hpp"
+ #include <cstring>
++#include <fstream>
+ #include <shared_mutex>
+ 
+ namespace dxmt {
+ 
++static bool
++er_diagnostics_enabled() {
++  auto value = env::getEnvVar("DXMT_ER_DIAGNOSTICS");
++  return !value.empty() && value != "0";
++}
++
++static void
++dump_er_pixel_shader(const Sha1Digest &sha1, const void *bytecode, size_t bytecode_length) {
++  if (!er_diagnostics_enabled())
++    return;
++
++  auto path = env::getEnvVar("DXMT_ER_DIAGNOSTICS_PATH");
++  if (path.empty())
++    path = env::getEnvVar("DXMT_LOG_PATH");
++  if (path.empty() || path == "none")
++    path = ".";
++  if (path.back() != '/')
++    path += '/';
++
++  path += env::getExeBaseName() + "_ps_" + sha1.string() + ".dxbc";
++  std::ofstream output(str::topath(path.c_str()).c_str(),
++                       std::ios::out | std::ios::binary | std::ios::trunc);
++  if (!output) {
++    Logger::warn(str::format("ERDIAG failed to dump pixel shader: ", path));
++    return;
++  }
++  output.write(reinterpret_cast<const char *>(bytecode), bytecode_length);
++  output.close();
++  Logger::info(str::format("ERDIAG pixel shader sha1=", sha1.string(),
++                           " bytes=", bytecode_length, " path=", path));
++}
++
+ class MTLD3D11InputLayout final
+     : public MTLD3D11DeviceChild<IMTLD3D11InputLayout> {
+ public:
+@@ -269,6 +304,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+     if (!managed_shader) {
+       return E_FAIL;
+     }
++    dump_er_pixel_shader(managed_shader->sha1(), pBytecode, BytecodeLength);
+     *ppShader = ref(new TShaderBase<ID3D11PixelShader, MTLD3D10PixelShader>(device, managed_shader));
+     return S_OK;
+   }
+diff --git a/src/d3d11/d3d11_shader.cpp b/src/d3d11/d3d11_shader.cpp
+index db5b795..79843bc 100644
+--- a/src/d3d11/d3d11_shader.cpp
++++ b/src/d3d11/d3d11_shader.cpp
+@@ -4,6 +4,7 @@
+ #include "config/config.hpp"
+ #include "d3d11_input_layout.hpp"
+ #include "sha1/sha1_util.hpp"
++#include "util_env.hpp"
+ #include <mutex>
+ 
+ namespace dxmt {
+@@ -20,6 +21,9 @@ getGlobalShaderFlag() {
+       shader_flag |= SM50_SHADER_FLAG_DEFUSE_FMA;
+     if (Config::getInstance().getOption<bool>("d3d11.sanitizeOutput", false))
+       shader_flag |= SM50_SHADER_FLAG_SANITIZE_OUTPUT;
++    auto marker = env::getEnvVar("DXMT_ER_MARK_NONFINITE");
++    if (!marker.empty() && marker != "0")
++      shader_flag |= SM50_SHADER_FLAG_MARK_NONFINITE_OUTPUT;
+   });
+   return shader_flag;
+ };
+@@ -51,6 +52,13 @@ public:
+     WMT::Reference<WMT::Error> err;
+     WMT::Reference<WMT::DispatchData> lib_data = shader_->find_cached_variant(variant_digest_);
+ 
++    auto diagnostics = env::getEnvVar("DXMT_ER_DIAGNOSTICS");
++    if (!diagnostics.empty() && diagnostics != "0")
++      Logger::info(str::format("ERDIAG compile function=", func_name,
++                               " shader=", shader_->sha1().string(),
++                               " variant=", variant_digest_.string(),
++                               " flags=", static_cast<uint32_t>(sm50_common.flags)));
++
+     while (lib_data != nullptr) {
+       auto library = device_->GetMTLDevice().newLibrary(lib_data, err);
+ 

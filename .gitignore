@@ -1,0 +1,41 @@
+build/
+build-crossover-26.1.0-diagnostic/
+crossover-26.1.0-diagnostic-runtime*/
+diagnostics/
+dxmt-runtime/
+dxmt-runtime-crossover-26.1.0-diagnostic/
+dxmt-runtime-native-foss/
+sources/
+toolchains/
+artifacts/
+backups/
+prefix/
+test-prefix-crossover-26.1.0-diagnostic/
+wine-build/
+wine-install/
+.package-tmp/
+.extract-llvm-mingw/
+*.log
+.DS_Store
+
+# Generated diagnostic tools and captures
+tools/**/*-x86_64
+tools/**/*.exe
+tools/**/*.so
+tools/**/*.dylib
+tools/**/*.trace
+tools/**/*.rdc
+tools/**/*-thumb.png
+tools/macho-fix-data-const
+tools/crossover-renderer-capture/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Editor settings and swap files
+.vscode/
+.idea/
+*.swp
+*.swo
